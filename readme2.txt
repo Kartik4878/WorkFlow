@@ -448,3 +448,504 @@ app.listen({ port: 3000 }, (err, address) => {
   console.log(`Server running at ${address}`);
 });
 
+assignmnetHandlers.ts
+
+
+import { FastifyReply, FastifyRequest } from 'fastify';
+import { getAllAssignments, getAssignmentById, transferAssignment } from '../services/assignmentService.js';
+import { createSession, getCaseSessions } from '../services/sessionService.js';
+import { getOperatorById, getOperators, getWorkqueues } from '../services/operatorServices.js';
+import { getAssignmentStatus } from '../validators/assignmentValidators.js';
+
+export const getAssignmentHandler = async (req: FastifyRequest, reply: FastifyReply) => {
+  const { assignmentId } = req.params as any;
+  const assignment = getAssignmentById(assignmentId);
+  
+  if (!assignment) return reply.status(404).send({ error: 'Assignment not found' });
+  
+  // Check assignment status using the new service function
+  const status = getAssignmentStatus(assignment, req.userId as string);
+  
+  if (!status.canAccess) {
+    return reply.status(status.errorCode!).send({ error: status.errorMessage });
+  }
+  
+  // If no active sessions exist, create one
+  const sessions = getCaseSessions(assignment.caseId);
+  if (sessions.length === 0) {
+    createSession(assignment.caseId, req.userId as string);
+  }
+  
+  reply.send(assignment);
+};
+
+export const transferAssignmentHandler = async (req: FastifyRequest, reply: FastifyReply) => {
+  // Extract parameters from request
+  const { assignmentId } = req.params as any;
+  if (!assignmentId) {
+    return reply.status(400).send({ error: 'assignmentId is required' });
+  }
+  
+  // Extract and validate body parameters
+  const { operatorId, routeToType } = req.body as any;
+  
+  // Validate required fields
+  if (!operatorId) {
+    return reply.status(400).send({ error: 'Operator ID is required' });
+  }
+  
+  if (!routeToType) {
+    return reply.status(400).send({ error: 'Route to type is required' });
+  }
+  
+  // Validate route type and operator ID
+  if (routeToType === "Operator") {
+    const operator = await getOperatorById(operatorId);
+    if(!operator) return reply.status(400).send({ error: 'Invalid Operator.' });
+    // Validate operator ID against available operators
+  } else if (routeToType === "WorkQueue") {
+    // Validate work queue ID against available work queues
+    const allWorkQueues = await getOperatorById(req.userId as string).workQueues;
+    if (!allWorkQueues.includes(operatorId)) {
+      return reply.status(400).send({ error: 'Invalid WorkQueue.' });
+    }
+  } else {
+    // Invalid route type
+    return reply.status(400).send({
+      error: 'Route to type can either be Operator or WorkQueue'
+    });
+  }
+  
+  // Use the service function to handle the transfer
+  const updatedAssignment = transferAssignment(
+    assignmentId,
+    operatorId,
+    routeToType,
+    req.userId as string
+  );
+  
+  // Handle case where assignment is not found
+  if (!updatedAssignment) {
+    return reply.status(404).send({ error: 'Assignment not found' });
+  }
+  
+  // Return the updated assignment
+  reply.send(updatedAssignment);
+}
+
+export const getAssignmentsHandler = async (req: FastifyRequest, reply: FastifyReply) => {
+  const assignments= getAllAssignments();
+  const userAssignments = assignments.filter((assignment)=>req.userId===assignment.assignedTo);
+  reply.send(userAssignments);
+};
+
+
+export const getWorkQueueAssignmentsHandler = async (req: FastifyRequest, reply: FastifyReply) => {
+  const assignments= getAllAssignments();
+  const { assignedTo } = req.params as any;
+  const workQueueAssignments = assignments.filter((assignment)=>assignment.assignedTo===assignedTo && assignment.assignedToType == "WorkQueue");
+  reply.send(workQueueAssignments);
+};
+
+
+
+caseHandlers.ts
+
+import { FastifyReply, FastifyRequest } from 'fastify';
+import { AssignmentInstance } from '../models/AssignmentInstance.js';
+import { CaseInstance } from '../models/CaseInstance.js';
+import { deleteAssignment, getAssignmentById, saveAssignment } from '../services/assignmentService.js';
+import { getAssignmentStatus } from '../validators/assignmentValidators.js';
+import { closeCase, createCaseSchema, getCaseById, getCases, getCaseTypeIDs, saveCase, updateCaseSchema } from '../services/caseService.js';
+import { createHistory } from '../services/historyService.js';
+import { getOperatorById, isOperatorAdmin } from '../services/operatorServices.js';
+import { deleteSession, getCaseSessions } from '../services/sessionService.js';
+import { getCaseTypeSchema } from '../utils/mockSchema.js';
+
+export const createCaseHandler = async (req: FastifyRequest, reply: FastifyReply) => {
+  const { caseTypeId } = req.body as any;
+  const currentOperator = getOperatorById(req.userId as string);
+  if(!currentOperator.WorkGroups.includes(caseTypeId))  return reply.status(400).send({ error: 'You is not allowed to create this case.' });
+
+  if (!caseTypeId) {
+    return reply.status(400).send({ error: 'caseTypeId is required' });
+  }
+  const userId = req.userId as string;
+  const caseInstance = new CaseInstance(caseTypeId, userId);
+  createHistory(caseInstance.caseId, `New case created by: ${req.userId}`, req.userId as string);
+  
+  saveCase(caseInstance);
+  reply.send(caseInstance);
+};
+
+export const nextHandler = async (req: FastifyRequest, reply: FastifyReply) => {
+  const caseId = (req.params as any).caseId;
+  const updates = req.body as Record<string, any>;
+  const currentCase = getCaseById(caseId);
+
+  if (!currentCase) return reply.status(400).send({ error: 'Case not found' });
+
+  const currentAssignment = getAssignmentById(currentCase.currentAssignmentId);
+  if (!currentAssignment) return reply.status(400).send({ error: 'Assignment not found' });
+  const status = getAssignmentStatus(currentAssignment, req.userId as string);
+        
+        if (!status.canAccess) {
+            return reply.status(status.errorCode as number).send({ error: status.errorMessage });
+        }
+  Object.assign(currentCase.metadata, updates);
+  const schema = getCaseTypeSchema(currentCase.caseTypeId);
+  const { processId, assignmentKey } = currentAssignment;
+
+  // Helper function to evaluate condition
+  const evaluateCondition = (condition: string): boolean => {
+    if (!condition) return true; // If no condition is specified, it's always true
+    try {
+      // Create a safe evaluation context with access to the currentCase
+      const evalContext = { currentCase };
+      // Use Function constructor to create a function that evaluates the condition
+      // This is safer than using eval() directly
+      const evalFunc = new Function('context', `with(context) { return ${condition}; }`);
+      return evalFunc(evalContext);
+    } catch (error) {
+      console.error(`Error evaluating condition: ${condition}`, error);
+      return false; // If there's an error evaluating, treat as false
+    }
+  };
+
+  // Find next valid assignment in current process
+  const processAssignments = schema.processes[processId]?.assignments || [];
+  let nextIndex = processAssignments.indexOf(assignmentKey) + 1;
+  let nextAssignmentKey = null;
+  let nextProcessId = processId;
+
+  // Check assignments in current process
+  while (nextIndex < processAssignments.length) {
+    const candidateAssignmentKey = processAssignments[nextIndex];
+    const assignmentCondition = schema.processes[processId].assignmentConfigs[candidateAssignmentKey]?.condition;
+    
+    if (evaluateCondition(assignmentCondition)) {
+      nextAssignmentKey = candidateAssignmentKey;
+      break;
+    }else{
+      createHistory(currentCase.caseId, `Case assignment skipped: ${candidateAssignmentKey}`, req.userId as string);
+    }
+    nextIndex++;
+  }
+
+  // If no valid assignment found in current process, look for next valid process
+  if (!nextAssignmentKey) {
+    const processIds = Object.keys(schema.processes);
+    let nextProcessIdx = processIds.indexOf(processId) + 1;
+    
+    while (nextProcessIdx < processIds.length) {
+      const candidateProcessId = processIds[nextProcessIdx];
+      const processCondition = schema.processes[candidateProcessId]?.condition;
+      
+      if (evaluateCondition(processCondition)) {
+        nextProcessId = candidateProcessId;
+        
+        // Find first valid assignment in the next process
+        const nextProcessAssignments = schema.processes[nextProcessId]?.assignments || [];
+        let assignmentIdx = 0;
+        
+        while (assignmentIdx < nextProcessAssignments.length) {
+          const candidateAssignmentKey = nextProcessAssignments[assignmentIdx];
+          const assignmentCondition = schema.processes[nextProcessId].assignmentConfigs[candidateAssignmentKey]?.condition;
+          
+          if (evaluateCondition(assignmentCondition)) {
+            nextAssignmentKey = candidateAssignmentKey;
+            break;
+          }else{
+            createHistory(currentCase.caseId, `Case assignment skipped: ${candidateAssignmentKey}`, req.userId as string);
+          }
+          assignmentIdx++;
+        }
+        
+        if (nextAssignmentKey) break; // Found valid assignment in this process
+      }else{
+        createHistory(currentCase.caseId, `Case process skipped: ${candidateProcessId}`, req.userId as string);
+      }
+      
+      nextProcessIdx++;
+    }
+    
+    // If no valid process/assignment found, case is resolved
+    if (!nextAssignmentKey) {
+      currentCase.currentAssignmentId = null;
+      currentCase.status = schema.resolvedStatus;
+      currentCase.updatedBy = req.userId as string;
+      createHistory(currentCase.caseId, `Case resolved by: ${req.userId}`, req.userId as string);
+    }
+  }
+
+  deleteAssignment(currentAssignment.assignmentId);
+  if (nextAssignmentKey && nextProcessId) {
+    // Pass "Operator" as the assignedToType parameter
+    const newAssignment = new AssignmentInstance(currentCase.caseId, nextProcessId, nextAssignmentKey, schema, req.userId as string, "");
+    saveAssignment(newAssignment);
+    currentCase.status = newAssignment.status;
+    currentCase.updatedAt = new Date();
+    currentCase.updatedBy = req.userId as string;
+    currentCase.currentAssignmentId = newAssignment.assignmentId;
+    createHistory(currentCase.caseId, `Case moved forward by: ${req.userId}`, req.userId as string);
+    // Save the updated case back to the store
+    saveCase(currentCase);
+  }
+deleteSession(currentCase.caseId,req.userId as string);
+reply.send(currentCase);
+};
+
+export const previousHandler = async (req: FastifyRequest, reply: FastifyReply) => {
+  const caseId = (req.params as any).caseId;
+  const currentCase = getCaseById(caseId);
+  if (!currentCase) return reply.status(400).send({ error: 'Case not found' });
+
+  const currentAssignment = getAssignmentById(currentCase.currentAssignmentId);
+
+  if (!currentAssignment) return reply.status(400).send({ error: 'Assignment not found' });
+  const status = getAssignmentStatus(currentAssignment, req.userId as string);
+        
+        if (!status.canAccess) {
+            return reply.status(status.errorCode as number).send({ error: status.errorMessage });
+        }
+
+  const schema = getCaseTypeSchema(currentCase.caseTypeId);
+  const { processId, assignmentKey } = currentAssignment;
+  
+  // Helper function to evaluate condition
+  const evaluateCondition = (condition: string): boolean => {
+    if (!condition) return true; // If no condition is specified, it's always true
+    try {
+      // Create a safe evaluation context with access to the currentCase
+      const evalContext = { currentCase };
+      // Use Function constructor to create a function that evaluates the condition
+      // This is safer than using eval() directly
+      const evalFunc = new Function('context', `with(context) { return ${condition}; }`);
+      return evalFunc(evalContext);
+    } catch (error) {
+      console.error(`Error evaluating condition: ${condition}`, error);
+      return false; // If there's an error evaluating, treat as false
+    }
+  };
+  
+  const processAssignments = schema.processes[processId]?.assignments || [];
+  const currentIdx = processAssignments.indexOf(assignmentKey);
+  
+  // Find previous valid assignment in current process
+  let previousIdx = currentIdx - 1;
+  let previousAssignmentKey = null;
+  let previousProcessId = processId;
+  
+  // Check assignments in current process
+  while (previousIdx >= 0) {
+    const candidateAssignmentKey = processAssignments[previousIdx];
+    const assignmentCondition = schema.processes[processId].assignmentConfigs[candidateAssignmentKey]?.condition;
+    
+    if (evaluateCondition(assignmentCondition)) {
+      previousAssignmentKey = candidateAssignmentKey;
+      break;
+    }else{
+      createHistory(currentCase.caseId, `Case assignment skipped: ${candidateAssignmentKey}`, req.userId as string);
+    }
+    previousIdx--;
+  }
+  
+  // If no valid assignment found in current process, look for previous valid process
+  if (!previousAssignmentKey) {
+    const processIds = Object.keys(schema.processes);
+    let previousProcessIdx = processIds.indexOf(processId) - 1;
+    
+    while (previousProcessIdx >= 0) {
+      const candidateProcessId = processIds[previousProcessIdx];
+      const processCondition = schema.processes[candidateProcessId]?.condition;
+      
+      if (evaluateCondition(processCondition)) {
+        previousProcessId = candidateProcessId;
+        
+        // Find last valid assignment in the previous process
+        const prevProcessAssignments = schema.processes[previousProcessId]?.assignments || [];
+        let assignmentIdx = prevProcessAssignments.length - 1;
+        
+        while (assignmentIdx >= 0) {
+          const candidateAssignmentKey = prevProcessAssignments[assignmentIdx];
+          const assignmentCondition = schema.processes[previousProcessId].assignmentConfigs[candidateAssignmentKey]?.condition;
+          
+          if (evaluateCondition(assignmentCondition)) {
+            previousAssignmentKey = candidateAssignmentKey;
+            break;
+          }else{
+            createHistory(currentCase.caseId, `Case assignment skipped: ${candidateAssignmentKey}`, req.userId as string);
+          }
+          assignmentIdx--;
+        }
+        
+        if (previousAssignmentKey) break; // Found valid assignment in this process
+      }else{
+        createHistory(currentCase.caseId, `Case process skipped: ${candidateProcessId}`, req.userId as string);
+      }
+      
+      previousProcessIdx--;
+    }
+  }
+
+  if (previousAssignmentKey && previousProcessId) {
+    // Pass "Operator" as the assignedToType parameter
+    const newAssignment = new AssignmentInstance(currentCase.caseId, previousProcessId, previousAssignmentKey, schema, req.userId as string, "");
+    saveAssignment(newAssignment);
+    currentCase.status = newAssignment.status;
+    currentCase.updatedAt = new Date();
+    currentCase.updatedBy = req.userId as string;
+    currentCase.currentAssignmentId = newAssignment.assignmentId;
+    deleteAssignment(currentAssignment.assignmentId);
+    createHistory(currentCase.caseId, `Case moved backward by: ${req.userId}`, req.userId as string);
+    // Save the updated case back to the store
+    saveCase(currentCase);
+  }
+  deleteSession(currentCase.caseId,req.userId as string);
+  reply.send(currentCase);
+};
+export const getAllCasesHandler = async (req: FastifyRequest, reply: FastifyReply) => {
+  const currentOperator = getOperatorById(req.userId as string);
+  if(!currentOperator) return reply.status(400).send({ error: 'Invalid request operator.' });
+  const cases = await getCases();
+  const operatorCases = cases.filter(caseDetails =>
+    currentOperator.WorkGroups.some((workGroup: string) => workGroup === caseDetails.caseTypeId)
+  );
+  reply.send(operatorCases);
+
+};
+
+export const saveHandler = async (req: FastifyRequest, reply: FastifyReply) => {
+  const caseId = (req.params as any).caseId;
+  const updates = req.body as Record<string, any>;
+  const currentCase = getCaseById(caseId);
+  if (!currentCase) return reply.status(400).send({ error: 'Case not found' });
+  const currentAssignment = getAssignmentById(currentCase.currentAssignmentId);
+
+  if (!currentAssignment) return reply.status(400).send({ error: 'Assignment not found' });
+  const status = getAssignmentStatus(currentAssignment, req.userId as string);
+        
+        if (!status.canAccess) {
+            return reply.status(status.errorCode as number).send({ error: status.errorMessage });
+        }
+  Object.assign(currentCase.metadata, updates);
+  saveCase(currentCase);
+  createHistory(currentCase.caseId, `Case details saved by: ${req.userId}`, req.userId as string);
+  reply.send(currentCase);
+}
+
+
+
+
+export const getCaseHandler = async (req: FastifyRequest, reply: FastifyReply) => {
+  const caseId = (req.params as any).caseId;
+  if (!caseId) return reply.status(400).send({ error: 'caseId is required' });
+  const caseDetails = getCaseById(caseId);
+  if (!caseDetails) return reply.status(400).send({ error: 'Case not found!' });
+  
+  const currentOperator = getOperatorById(req.userId as string);
+  if(!currentOperator.WorkGroups.includes(caseDetails.caseTypeId))  return reply.status(400).send({ error: 'You is not allowed to access this case.' });
+  
+  reply.send(getCaseById(caseId));
+}
+
+export const getCaseTypesHandler = async (req: FastifyRequest, reply: FastifyReply) => {
+  const currentOperator = getOperatorById(req.userId as string);
+  if(!currentOperator) return reply.status(400).send({ error: 'Invalid request operator.' });
+  const allCasetypes = await getCaseTypeIDs();
+  const operatorCaseTypes = allCasetypes.filter(caseType =>
+    currentOperator.WorkGroups.some((workGroup: string) => workGroup === caseType));
+  reply.send(operatorCaseTypes);
+}
+
+export const closeCaseHandler = async (req: FastifyRequest, reply: FastifyReply) => {
+  const currentOperator = getOperatorById(req.userId as string);
+  const {caseId} = req.body as any;
+  
+  // Check if there are any sessions for this case
+  const sessions = getCaseSessions(caseId);
+  
+  if (sessions.length > 0) {
+    // If there's an active session and it's not created by the current user, return an error
+    if (sessions[0].createdBy !== req.userId) {
+      return reply.status(402).send({ error: `Case is currently assigned to ${sessions[0].createdBy}` });
+    }
+  }
+  
+  // Delete the session
+  const closedSession = closeCase(caseId, req.userId as string);
+  
+  reply.send({ status: closedSession });
+}
+
+export const getCaseTypeSchemaHandler = async (req: FastifyRequest, reply: FastifyReply) => {
+  const schemaID = (req.params as any).schemaID;
+  
+  if (!schemaID) {
+    return reply.status(400).send({ error: 'schemaID is required' });
+  }
+  
+  const schema = getCaseTypeSchema(schemaID);
+  
+  if (!schema) {
+    return reply.status(404).send({ error: 'Case type schema not found' });
+  }
+  
+  reply.send(schema);
+};
+
+export const postCaseTypeSchemaHandler = async (req: FastifyRequest, reply: FastifyReply) => {
+  if(!isOperatorAdmin(req.userId as string)) return reply.status(401).send({ error: 'Admin access is required.' });
+  const schemaID = (req.params as any).schemaID;
+  const schemaData = req.body as any;
+  
+  if (!schemaID) {
+    return reply.status(400).send({ error: 'schemaID is required' });
+  }
+  
+  if (!schemaData) {
+    return reply.status(400).send({ error: 'Schema data is required' });
+  }
+  
+  const success = updateCaseSchema(schemaID, schemaData);
+  
+  if (!success) {
+    return reply.status(404).send({ error: 'Case type schema not found' });
+  }
+  
+  // Return the updated schema
+  const updatedSchema = getCaseTypeSchema(schemaID);
+  reply.send(updatedSchema);
+};
+
+export const addCaseTypeSchemaHandler = async (req: FastifyRequest, reply: FastifyReply) => {
+  if(!isOperatorAdmin(req.userId as string)) return reply.status(401).send({ error: 'Admin access is required.' });
+  const schemaID = (req.body as any).id;
+  const schemaData = req.body as any;
+  
+  if (!schemaID) {
+    return reply.status(400).send({ error: 'schemaID is required' });
+  }
+  
+  if (!schemaData) {
+    return reply.status(400).send({ error: 'Schema data is required' });
+  }
+  
+  // Check if schema already exists
+  const existingSchema = getCaseTypeSchema(schemaID);
+  if (existingSchema) {
+    return reply.status(409).send({ error: 'Case type schema already exists' });
+  }
+  
+  const success = createCaseSchema(schemaID, schemaData);
+  
+  if (!success) {
+    return reply.status(500).send({ error: 'Failed to create case type schema' });
+  }
+  
+  // Return the newly created schema
+  const newSchema = getCaseTypeSchema(schemaID);
+  reply.status(201).send(newSchema);
+};
+
+
