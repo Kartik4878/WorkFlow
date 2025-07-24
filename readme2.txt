@@ -1003,3 +1003,75 @@ export const createCaseSchema = (schemaId: string, schemaData: any): boolean => 
   return createCaseTypeSchema(schemaId, schemaData);
 };
 
+SessionService.ts
+
+
+import { sessionStore } from '../store/caseStore.js';
+import { SessionInstance } from '../models/SessionInstance.js';
+
+/**
+ * Creates a new session record and saves it to the session store
+ * @param caseId The ID of the case
+ * @param createdBy Who created the session
+ * @returns The created session instance
+ */
+export const createSession = (caseId: string, createdBy: string): SessionInstance => {
+  // Check if a session already exists for this user and case
+  const existingSessions = Object.values(sessionStore)
+    .filter((session: any) => session.caseId === caseId && session.createdBy === createdBy);
+  
+  // If a session already exists, return the existing session
+  if (existingSessions.length > 0) {
+    return existingSessions[0] as SessionInstance;
+  }
+  
+  // Otherwise, create a new session
+  const sessionInstance = new SessionInstance(caseId, createdBy);
+  sessionStore[sessionInstance.sessionId] = sessionInstance;
+  return sessionInstance;
+};
+
+/**
+ * Gets all session records for a specific case
+ * @param caseId The ID of the case
+ * @returns Array of session instances for the specified case
+ */
+export const getCaseSessions = (caseId: string): SessionInstance[] => {
+  return Object.values(sessionStore)
+    .filter((session: any) => session.caseId === caseId)
+    .map((entry: any) => entry);
+};
+
+/**
+ * Gets all session records created by a specific user
+ * @param userId The ID of the user
+ * @returns Array of session instances created by the specified user
+ */
+export const getUserSessions = (userId: string): SessionInstance[] => {
+  return Object.values(sessionStore)
+    .filter((session: any) => session.createdBy === userId)
+    .map((entry: any) => entry);
+};
+
+/**
+ * Deletes a session for a specific case and user
+ * @param caseId The ID of the case
+ * @param userId The ID of the user
+ * @returns Boolean indicating whether the deletion was successful
+ */
+export const deleteSession = (caseId: string, userId: string): boolean => {
+  const sessions = Object.entries(sessionStore)
+    .filter(([_, session]: [string, any]) =>
+      session.caseId === caseId && session.createdBy === userId);
+  
+  if (sessions.length === 0) {
+    return false;
+  }
+  
+  // Delete all matching sessions
+  sessions.forEach(([sessionId, _]) => {
+    delete sessionStore[sessionId];
+  });
+  
+  return true;
+};
