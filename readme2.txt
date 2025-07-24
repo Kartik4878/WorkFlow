@@ -982,3 +982,24 @@ export const transferAssignment = (assignmentId: string, operatorId: string, rou
   return assignment;
 };
 
+caseService.ts
+
+import { caseStore } from '../store/caseStore.js';
+import { mockSchemas, updateCaseTypeSchema, createCaseTypeSchema } from '../utils/mockSchema.js';
+import { deleteSession } from './sessionService.js';
+export const saveCase = (caseObj: any) => caseStore[caseObj.caseId] = caseObj;
+export const getCaseById = (id: string) => caseStore[id];
+export const getCases = () => Object.values(caseStore).map(entry => entry);
+export const getCaseTypeIDs = (): string[] => Object.keys(mockSchemas);
+export const closeCase = (caseId: string, userId: string): boolean => {
+    return deleteSession(caseId, userId);
+  };
+
+export const updateCaseSchema = (schemaId: string, schemaData: any): boolean => {
+  return updateCaseTypeSchema(schemaId, schemaData);
+};
+
+export const createCaseSchema = (schemaId: string, schemaData: any): boolean => {
+  return createCaseTypeSchema(schemaId, schemaData);
+};
+
