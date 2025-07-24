@@ -948,4 +948,37 @@ export const addCaseTypeSchemaHandler = async (req: FastifyRequest, reply: Fasti
   reply.status(201).send(newSchema);
 };
 
+assignmentServices.ts
+
+import { assignmentStore } from '../store/caseStore.js';
+import { deleteSession } from './sessionService.js';
+import { createHistory } from './historyService.js';
+
+export const saveAssignment = (assignment: any) => assignmentStore[assignment.assignmentId] = assignment;
+export const getAssignmentById = (id: string) => assignmentStore[id];
+export const getAllAssignments = () => Object.values(assignmentStore).map(entry => entry);
+export const deleteAssignment = (assignmentId: string) => delete assignmentStore[assignmentId];
+
+export const transferAssignment = (assignmentId: string, operatorId: string, routeToType: string, userId: string): any => {
+  const assignment = getAssignmentById(assignmentId);
+  
+  if (!assignment) {
+    return null;
+  }
+  
+  // Update assignment details
+  assignment.assignedTo = operatorId;
+  assignment.assignedToType = routeToType;
+  
+  // Create history record
+  createHistory(assignment.caseId, `Case transferred to ${operatorId} by : ${userId}`, userId);
+  
+  // Save the updated assignment
+  saveAssignment(assignment);
+  
+  // Delete the session
+  deleteSession(assignment.caseId, userId);
+  
+  return assignment;
+};
 
